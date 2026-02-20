@@ -1,0 +1,400 @@
+import math
+import omni.usd
+from pxr import UsdGeom, UsdShade, Sdf, Gf
+from pxr import Usd  # set_cast_shadows_off で使う
+
+# ========= 設定 =========
+CAMERA_PATH = "/World/Drone/Camera"
+
+# ルート（全体のスケールなど）
+VIZ_ROOT_PATH   = CAMERA_PATH + "/FrustumVizRoot"
+
+# ★追加：面と線を別グループにして、別オフセットを入れられるようにする
+MESH_ROOT_PATH  = VIZ_ROOT_PATH + "/MeshRoot"
+LINES_ROOT_PATH = VIZ_ROOT_PATH + "/LinesRoot"
+
+# 子プリム
+MESH_PATH     = MESH_ROOT_PATH + "/FrustumMesh"
+CURVES_PATH   = LINES_ROOT_PATH + "/FrustumCurves"
+
+# カメラ値が取れない時のデフォルト
+HFOV_DEG_DEFAULT = 90.0
+VFOV_DEG_DEFAULT = 60.0
+NEAR_DEFAULT = 0.2
+FAR_DEFAULT  = 18.0
+
+# 可視化用の FAR クランプ（カメラが 1e7 みたいな値を返すケース対策）
+FAR_VIS_MAX = 200.0
+
+# カメラ方向軸に対するボリューム表示方向の符号（デフォルトはカメラ前方が -Z なので -1）
+FORWARD_SIGN = -1.0
+
+# ★追加：面と線のオフセットを別々に設定（カメラローカルZ方向に動かす）
+#   実際の移動量 = FORWARD_SIGN * VIS_OFFSET_SIGN * OFFSET_VALUE
+VIS_OFFSET_SIGN  = -1   # オフセットの符号の入れ替え　＋で前方、－で後方
+MESH_OFFSET_VALUE  = 0.2 # 面だけのオフセット
+LINES_OFFSET_VALUE = 0.35  # 線だけのオフセット（例：面と重ならないように少しずらす）
+
+INITIAL_SCALE = 1.0
+
+# Curves 表示
+CURVE_WIDTH = 0.05
+CURVE_COLOR = (0.2, 0.8, 1.0)
+
+# purpose（guideは表示OFFだと消えるので default 推奨）
+PURPOSE = "default"  # "default" / "render" / "proxy" / "guide"
+
+# ---- 面マテリアル----
+DEFAULT_DIFFUSE = (0.2, 1.0, 0.28649)
+DEFAULT_EMISSIVE = (0.0, 0.0, 0.0)
+DEFAULT_USE_SPECULAR_WORKFLOW = False
+DEFAULT_SPECULAR = (0.0, 0.0, 0.0)
+DEFAULT_METALLIC = 0.0
+DEFAULT_ROUGHNESS = 1.0
+DEFAULT_CLEARCOAT = 0.0
+DEFAULT_CLEARCOAT_ROUGHNESS = 0.0
+DEFAULT_OPACITY = 0.02
+DEFAULT_OPACITY_THRESHOLD = 0.0
+DEFAULT_IOR = 1.0
+DEFAULT_NORMAL = (0.0, 0.0, 0.3)
+# ========================
+
+
+# ========================
+# Utility
+# ========================
+def _safe_get_attr(attr, default=None):
+    if not attr:
+        return default
+    try:
+        v = attr.Get()
+        return default if v is None else v
+    except Exception:
+        return default
+
+
+def _compute_fov_deg_from_focal_aperture(focal_length, aperture):
+    if focal_length is None or aperture is None:
+        return None
+    try:
+        f = float(focal_length)
+        a = float(aperture)
+        if f <= 0.0 or a <= 0.0:
+            return None
+        return math.degrees(2.0 * math.atan((a * 0.5) / f))
+    except Exception:
+        return None
+
+
+def set_purpose(stage, prim_path: str, purpose: str):
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim and prim.IsValid():
+        UsdGeom.Imageable(prim).CreatePurposeAttr().Set(purpose)
+
+
+def force_visible(stage, prim_path: str):
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim and prim.IsValid():
+        UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+
+
+def _get_or_add_op(xf: UsdGeom.Xformable, op_type):
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpType() == op_type:
+            return op
+    if op_type == UsdGeom.XformOp.TypeTranslate:
+        return xf.AddTranslateOp()
+    if op_type == UsdGeom.XformOp.TypeScale:
+        return xf.AddScaleOp()
+    raise RuntimeError("Unsupported op type")
+
+
+def set_xform_translate(stage, prim_path: str, t: Gf.Vec3f):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Prim not found: {prim_path}")
+    xf = UsdGeom.Xformable(prim)
+    t_op = _get_or_add_op(xf, UsdGeom.XformOp.TypeTranslate)
+    t_op.Set(Gf.Vec3f(float(t[0]), float(t[1]), float(t[2])))
+
+
+def set_xform_scale(stage, prim_path: str, s: float):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Prim not found: {prim_path}")
+    xf = UsdGeom.Xformable(prim)
+    s_op = _get_or_add_op(xf, UsdGeom.XformOp.TypeScale)
+    s_op.Set(Gf.Vec3f(float(s), float(s), float(s)))
+
+
+def remove_prim_if_exists(stage, prim_path: str):
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim and prim.IsValid():
+        try:
+            stage.RemovePrim(Sdf.Path(prim_path))
+        except Exception:
+            prim.SetActive(False)
+
+
+# ========================
+# Camera → frustum params（取れない値はデフォルト）
+# ========================
+def get_frustum_params_from_camera(stage, camera_path: str):
+    hfov = HFOV_DEG_DEFAULT
+    vfov = VFOV_DEG_DEFAULT
+    near = NEAR_DEFAULT
+    far  = FAR_DEFAULT
+
+    prim = stage.GetPrimAtPath(camera_path)
+    if not prim.IsValid():
+        print(f"[WARN] Camera prim not found: {camera_path} -> defaults")
+        return hfov, vfov, near, far
+
+    cam = UsdGeom.Camera(prim)
+    if not cam:
+        print(f"[WARN] Prim is not UsdGeom.Camera: {camera_path} -> defaults")
+        return hfov, vfov, near, far
+
+    cr = _safe_get_attr(cam.GetClippingRangeAttr(), None)
+    if cr is not None:
+        try:
+            n = float(cr[0]); f = float(cr[1])
+            if n > 0.0 and f > n:
+                near, far = n, f
+        except Exception:
+            pass
+
+    focal = _safe_get_attr(cam.GetFocalLengthAttr(), None)
+    h_ap  = _safe_get_attr(cam.GetHorizontalApertureAttr(), None)
+    v_ap  = _safe_get_attr(cam.GetVerticalApertureAttr(), None)
+
+    hfov_calc = _compute_fov_deg_from_focal_aperture(focal, h_ap)
+    vfov_calc = _compute_fov_deg_from_focal_aperture(focal, v_ap)
+
+    if hfov_calc is not None:
+        hfov = hfov_calc
+    if vfov_calc is not None:
+        vfov = vfov_calc
+
+    return float(hfov), float(vfov), float(near), float(far)
+
+
+# ========================
+# Frustum corners
+# ========================
+def _frustum_corners(hfov_deg, vfov_deg, near, far, forward_sign=+1.0):
+    hf = math.radians(hfov_deg) * 0.5
+    vf = math.radians(vfov_deg) * 0.5
+
+    wn = 2.0 * near * math.tan(hf)
+    hn = 2.0 * near * math.tan(vf)
+    wf = 2.0 * far  * math.tan(hf)
+    hf_ = 2.0 * far  * math.tan(vf)
+
+    zn = forward_sign * near
+    zf = forward_sign * far
+
+    n0 = Gf.Vec3f(-wn/2, -hn/2, zn)
+    n1 = Gf.Vec3f( wn/2, -hn/2, zn)
+    n2 = Gf.Vec3f( wn/2,  hn/2, zn)
+    n3 = Gf.Vec3f(-wn/2,  hn/2, zn)
+
+    f0 = Gf.Vec3f(-wf/2, -hf_/2, zf)
+    f1 = Gf.Vec3f( wf/2, -hf_/2, zf)
+    f2 = Gf.Vec3f( wf/2,  hf_/2, zf)
+    f3 = Gf.Vec3f(-wf/2,  hf_/2, zf)
+
+    return [n0,n1,n2,n3, f0,f1,f2,f3]
+
+
+# ========================
+# Surface mesh（面）
+# ========================
+def create_or_update_frustum_surface_mesh(stage, mesh_path, hfov_deg, vfov_deg, near, far, forward_sign=+1.0):
+    pts = _frustum_corners(hfov_deg, vfov_deg, near, far, forward_sign)
+    mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+
+    faces = [
+        [0, 4, 5, 1],
+        [1, 5, 6, 2],
+        [2, 6, 7, 3],
+        [3, 7, 4, 0],
+    ]
+    if forward_sign < 0.0:
+        faces = [list(reversed(f)) for f in faces]
+
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateFaceVertexCountsAttr([4]*len(faces))
+    mesh.CreateFaceVertexIndicesAttr([i for f in faces for i in f])
+    mesh.CreateSubdivisionSchemeAttr("none")
+
+    prim = mesh.GetPrim()
+    ds = prim.GetAttribute("doubleSided")
+    if not ds:
+        ds = prim.CreateAttribute("doubleSided", Sdf.ValueTypeNames.Bool)
+    ds.Set(True)
+    prim.SetActive(True)
+    return mesh
+
+
+def bind_preview_surface_defaults(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return
+
+    mat_path = prim_path + "_Mat"
+    shader_path = mat_path + "/Shader"
+    mat = UsdShade.Material.Define(stage, mat_path)
+    shader = UsdShade.Shader.Define(stage, shader_path)
+
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*DEFAULT_DIFFUSE))
+    shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*DEFAULT_EMISSIVE))
+    shader.CreateInput("useSpecularWorkflow", Sdf.ValueTypeNames.Bool).Set(bool(DEFAULT_USE_SPECULAR_WORKFLOW))
+    shader.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*DEFAULT_SPECULAR))
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_METALLIC))
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_ROUGHNESS))
+    shader.CreateInput("clearcoat", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_CLEARCOAT))
+    shader.CreateInput("clearcoatRoughness", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_CLEARCOAT_ROUGHNESS))
+    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_OPACITY))
+    shader.CreateInput("opacityThreshold", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_OPACITY_THRESHOLD))
+    shader.CreateInput("ior", Sdf.ValueTypeNames.Float).Set(float(DEFAULT_IOR))
+    shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).Set(Gf.Vec3f(*DEFAULT_NORMAL))
+
+    mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI(prim).Bind(mat)
+
+
+# =========================
+# Curves
+# =========================
+def create_or_update_frustum_lines_curves_reference(
+    stage, lines_path,
+    hfov_deg, vfov_deg, near, far,
+    forward_sign=+1.0, line_width=0.03,
+    color_rgb01=(0.2, 0.8, 1.0)
+):
+    corners = _frustum_corners(hfov_deg, vfov_deg, near, far, forward_sign)
+    n0,n1,n2,n3,f0,f1,f2,f3 = corners
+    edges = [(n0,f0),(n1,f1),(n2,f2),(n3,f3)]
+
+    remove_prim_if_exists(stage, lines_path)
+    curves = UsdGeom.BasisCurves.Define(stage, lines_path)
+
+    points = []
+    counts = []
+    for a, b in edges:
+        points.extend([a, b])
+        counts.append(2)
+
+    curves.CreateTypeAttr("linear")
+    curves.CreateWrapAttr("nonperiodic")
+    curves.CreateCurveVertexCountsAttr(counts)
+    curves.CreatePointsAttr(points)
+
+    curves.CreateWidthsAttr([float(line_width)] * sum(counts))
+
+    try:
+        UsdGeom.Primvar(curves.GetWidthsAttr()).SetInterpolation(UsdGeom.Tokens.vertex)
+    except Exception:
+        pass
+
+    curves.CreateDisplayColorAttr([Gf.Vec3f(*color_rgb01)])
+
+    prim = curves.GetPrim()
+    prim.SetActive(True)
+    UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+    return curves
+
+
+def set_cast_shadows_off(stage, prim_path: str, recursive: bool = False):
+    """
+    Mesh Property の 'Cast Shadows' を OFF 相当にする。
+    Omniverse/Isaac Sim では primvars:doNotCastShadows = True を使う。
+    """
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return
+
+    def _apply(p):
+        if not p.IsA(UsdGeom.Imageable):
+            return
+        attr = p.GetAttribute("primvars:doNotCastShadows")
+        if not attr:
+            attr = p.CreateAttribute("primvars:doNotCastShadows", Sdf.ValueTypeNames.Bool)
+        attr.Set(True)
+
+    if recursive:
+        for p in Usd.PrimRange(prim):
+            _apply(p)
+    else:
+        _apply(prim)
+
+
+# =========================
+# 実行
+# =========================
+stage = omni.usd.get_context().get_stage()
+
+# Rootを作る
+UsdGeom.Xform.Define(stage, VIZ_ROOT_PATH)
+UsdGeom.Xform.Define(stage, MESH_ROOT_PATH)
+UsdGeom.Xform.Define(stage, LINES_ROOT_PATH)
+
+set_purpose(stage, VIZ_ROOT_PATH, PURPOSE)
+set_purpose(stage, MESH_ROOT_PATH, PURPOSE)
+set_purpose(stage, LINES_ROOT_PATH, PURPOSE)
+
+force_visible(stage, VIZ_ROOT_PATH)
+force_visible(stage, MESH_ROOT_PATH)
+force_visible(stage, LINES_ROOT_PATH)
+
+# カメラ値取得
+HFOV_DEG, VFOV_DEG, NEAR, FAR = get_frustum_params_from_camera(stage, CAMERA_PATH)
+
+# ★重要：FARが異常に大きい場合は可視化用にクランプ
+FAR_ORIG = FAR
+if FAR > FAR_VIS_MAX:
+    FAR = FAR_DEFAULT
+    print(f"[WARN] FAR too large ({FAR_ORIG}) -> clamp to FAR_DEFAULT={FAR}")
+
+print(f"📷 Camera frustum used: HFOV={HFOV_DEG:.3f} VFOV={VFOV_DEG:.3f} NEAR={NEAR:.3f} FAR={FAR:.3f}")
+
+# ---- スケールは共通（rootにだけ入れる）----
+set_xform_scale(stage, VIZ_ROOT_PATH, INITIAL_SCALE)
+
+# 面と線のオフセット
+mesh_offset_z  = float(FORWARD_SIGN * VIS_OFFSET_SIGN * MESH_OFFSET_VALUE)
+lines_offset_z = float(FORWARD_SIGN * VIS_OFFSET_SIGN * LINES_OFFSET_VALUE)
+
+set_xform_translate(stage, MESH_ROOT_PATH,  Gf.Vec3f(0.0, 0.0, mesh_offset_z))
+set_xform_translate(stage, LINES_ROOT_PATH, Gf.Vec3f(0.0, 0.0, lines_offset_z))
+
+# 面
+create_or_update_frustum_surface_mesh(
+    stage, MESH_PATH,
+    HFOV_DEG, VFOV_DEG, float(NEAR), float(FAR),
+    forward_sign=float(FORWARD_SIGN)
+)
+bind_preview_surface_defaults(stage, MESH_PATH)
+set_purpose(stage, MESH_PATH, PURPOSE)
+force_visible(stage, MESH_PATH)
+
+# Curves
+create_or_update_frustum_lines_curves_reference(
+    stage, CURVES_PATH,
+    HFOV_DEG, VFOV_DEG, float(NEAR), float(FAR),
+    forward_sign=float(FORWARD_SIGN),
+    line_width=float(CURVE_WIDTH),
+    color_rgb01=CURVE_COLOR
+)
+set_purpose(stage, CURVES_PATH, PURPOSE)
+force_visible(stage, CURVES_PATH)
+
+# 影OFF
+set_cast_shadows_off(stage, MESH_ROOT_PATH, recursive=True)
+set_cast_shadows_off(stage, LINES_ROOT_PATH, recursive=True)
+
+print("Mesh created:", MESH_PATH, "mesh_offset_z=", mesh_offset_z)
+print("Curves created:", CURVES_PATH, "lines_offset_z=", lines_offset_z)
+print("Done.")
